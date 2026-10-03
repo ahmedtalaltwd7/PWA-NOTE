@@ -1,5 +1,4 @@
 const DB_NAME = 'pocket-notes';
-const DB_VERSION = 1;
 
 let databasePromise;
 
@@ -7,18 +6,32 @@ function openDatabase() {
 	if (databasePromise) return databasePromise;
 
 	databasePromise = new Promise((resolve, reject) => {
-		const request = indexedDB.open(DB_NAME, DB_VERSION);
+		const request = indexedDB.open(DB_NAME);
 
-		request.onupgradeneeded = () => {
+		request.onupgradeneeded = (event) => {
 			const database = request.result;
-			const notes = database.createObjectStore('notes', { keyPath: 'id' });
-			notes.createIndex('updatedAt', 'updatedAt');
-			database.createObjectStore('outbox', { keyPath: 'id', autoIncrement: true });
+			if (!database.objectStoreNames.contains('notes')) {
+				const notes = database.createObjectStore('notes', { keyPath: 'id' });
+				notes.createIndex('updatedAt', 'updatedAt');
+			}
 		};
 
-		request.onsuccess = () => resolve(request.result);
-		request.onerror = () => reject(request.error ?? new Error('Unable to open local notes storage.'));
-		request.onblocked = () => reject(new Error('Local notes storage is blocked by another open tab.'));
+		request.onsuccess = () => {
+			const database = request.result;
+			database.onversionchange = () => {
+				database.close();
+				databasePromise = undefined;
+			};
+			resolve(database);
+		};
+		request.onerror = () => {
+			databasePromise = undefined;
+			reject(request.error ?? new Error('Unable to open local notes storage.'));
+		};
+		request.onblocked = () => {
+			databasePromise = undefined;
+			reject(new Error('Local notes storage is blocked by another open tab.'));
+		};
 	});
 
 	return databasePromise;
@@ -38,57 +51,32 @@ export async function getNotes() {
 	const done = transactionDone(transaction);
 	const request = transaction.objectStore('notes').getAll();
 	const notes = await new Promise((resolve, reject) => {
-		request.onsuccess = () => resolve(request.result);
+		request.onsuccess = () => {
+			const database = request.result;
+			database.onversionchange = () => {
+				database.close();
+				databasePromise = undefined;
+			};
+			resolve(database);
+		};
 		request.onerror = () => reject(request.error ?? new Error('Unable to read notes.'));
 	});
 	await done;
-	return notes.sort((a, b) => b.updatedAt - a.updatedAt);
+	return notes;
 }
 
-export async function saveNote(note, action) {
+export async function saveNote(note) {
 	const database = await openDatabase();
-	const transaction = database.transaction(['notes', 'outbox'], 'readwrite');
+	const transaction = database.transaction('notes', 'readwrite');
 	const done = transactionDone(transaction);
 	transaction.objectStore('notes').put(note);
-	transaction.objectStore('outbox').add({
-		action,
-		noteId: note.id,
-		payload: note,
-		queuedAt: Date.now()
-	});
 	await done;
 }
 
 export async function deleteNote(id) {
 	const database = await openDatabase();
-	const transaction = database.transaction(['notes', 'outbox'], 'readwrite');
+	const transaction = database.transaction('notes', 'readwrite');
 	const done = transactionDone(transaction);
 	transaction.objectStore('notes').delete(id);
-	transaction.objectStore('outbox').add({
-		action: 'delete',
-		noteId: id,
-		queuedAt: Date.now()
-	});
 	await done;
-}
-
-export async function clearOutbox() {
-	const database = await openDatabase();
-	const transaction = database.transaction('outbox', 'readwrite');
-	const done = transactionDone(transaction);
-	transaction.objectStore('outbox').clear();
-	await done;
-}
-
-export async function getOutboxCount() {
-	const database = await openDatabase();
-	const transaction = database.transaction('outbox', 'readonly');
-	const done = transactionDone(transaction);
-	const request = transaction.objectStore('outbox').count();
-	const count = await new Promise((resolve, reject) => {
-		request.onsuccess = () => resolve(request.result);
-		request.onerror = () => reject(request.error ?? new Error('Unable to check pending changes.'));
-	});
-	await done;
-	return count;
 }

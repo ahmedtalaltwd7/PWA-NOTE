@@ -1,10 +1,11 @@
 <script>
 	import { onDestroy, onMount } from 'svelte';
-	import { clearOutbox, deleteNote, getNotes, getOutboxCount, saveNote } from '#lib/notes-db';
+	import { deleteNote, getNotes, saveNote } from '#lib/notes-db';
 
 	let notes = $state([]);
 	let isLoading = $state(true);
 	let isOnline = $state(true);
+	let offlineReady = $state(false);
 	let isDark = $state(false);
 	let search = $state('');
 	let typeFilter = $state('all');
@@ -25,24 +26,36 @@
 	let recordingInterval;
 	const audioUrls = new Map();
 
+	function normalizeSearchText(value) {
+		return String(value ?? '')
+			.normalize('NFKD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.replace(/[^\p{L}\p{N}]+/gu, ' ')
+			.toLocaleLowerCase();
+	}
+
 	const filteredNotes = $derived.by(() => {
+		const queryWords = normalizeSearchText(search).trim().split(/\s+/).filter(Boolean);
 		const matching = notes.filter((note) => {
 			const matchesType =
-				typeFilter === 'all' || (typeFilter === 'voice' ? note.audio : !note.audio);
-			const matchesStatus = statusFilter === 'all' || note.completed;
-			const query = search.trim().toLowerCase();
-			const matchesSearch =
-				!query || `${note.title} ${note.content}`.toLowerCase().includes(query);
+				typeFilter === 'all' || (typeFilter === 'voice' ? Boolean(note.audio) : !note.audio);
+			const matchesStatus = statusFilter === 'all' || Boolean(note.completed);
+			const searchableText = normalizeSearchText(`${note.title} ${note.content}`);
+			const matchesSearch = queryWords.every((word) => searchableText.includes(word));
 			return matchesType && matchesStatus && matchesSearch;
 		});
 
-		return matching.sort((a, b) =>
-			sortBy === 'name'
-				? a.title.localeCompare(b.title, undefined, { sensitivity: 'base', numeric: true })
-				: b.updatedAt - a.updatedAt
-		);
+		const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+		return matching.sort((a, b) => {
+			const dateDifference =
+				(Number(b.updatedAt) || Number(b.createdAt) || 0) -
+				(Number(a.updatedAt) || Number(a.createdAt) || 0);
+			return sortBy === 'name'
+				? collator.compare(a.title || '', b.title || '') || dateDifference
+				: dateDifference || collator.compare(a.title || '', b.title || '');
+		});
 	});
-	const notesByType = $derived(
+	const notesByType = $derived.by(() =>
 		notes.filter(
 			(note) => typeFilter === 'all' || (typeFilter === 'voice' ? note.audio : !note.audio)
 		)
@@ -139,15 +152,11 @@
 		};
 
 		try {
-			await saveNote(note, editingId ? 'update' : 'create');
+			await saveNote(note);
 			await refreshNotes();
 			closeEditor();
-			if (isOnline) {
-				void flushOutbox();
-				notify('Note saved on this device.');
-			} else {
-				notify('Saved offline — will sync when online');
-			}
+			notify(isOnline ? 'Note saved on this device.' : 'Saved offline — available on this device.');
+
 		} catch (error) {
 			console.error('Could not save note:', error);
 			notify('Your note could not be saved. Check device storage and try again.');
@@ -159,8 +168,7 @@
 		try {
 			await deleteNote(note.id);
 			await refreshNotes();
-			if (isOnline) void flushOutbox();
-			notify(isOnline ? 'Note deleted.' : 'Deleted offline — will sync when online');
+			notify(isOnline ? 'Note deleted.' : 'Deleted offline — saved on this device.');
 		} catch (error) {
 			console.error('Could not delete note:', error);
 			notify('This note could not be deleted. Please try again.');
@@ -170,9 +178,8 @@
 	async function toggleCompleted(note) {
 		const updatedNote = { ...note, completed: !note.completed, updatedAt: Date.now() };
 		try {
-			await saveNote(updatedNote, 'update');
+			await saveNote(updatedNote);
 			await refreshNotes();
-			if (isOnline) void flushOutbox();
 			notify(updatedNote.completed ? 'Note marked completed.' : 'Note moved back to active.');
 		} catch (error) {
 			console.error('Could not update note status:', error);
@@ -236,56 +243,59 @@
 		return `${dayLabel} · ${date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
 	}
 
-	async function flushOutbox() {
-		try {
-			if (!navigator.onLine) return;
-			const pending = await getOutboxCount();
-			if (!pending) return;
-			let backgroundSyncRegistered = false;
-			if ('serviceWorker' in navigator && 'SyncManager' in window) {
-				try {
-					const registration = await navigator.serviceWorker.ready;
-					await registration.sync.register('pocket-notes-outbox');
-					backgroundSyncRegistered = true;
-				} catch (error) {
-					console.warn('Background Sync is unavailable; processing queued changes in this page:', error);
-				}
-			}
-			if (!backgroundSyncRegistered) {
-				await clearOutbox();
-				notify('All changes synced ✅');
-			}
-		} catch (error) {
-			console.error('Could not process the local changes queue:', error);
-			notify('Changes are safe on this device; sync will retry when online.');
-		}
-	}
-
 	function onOnline() {
 		isOnline = true;
-		void flushOutbox();
+		notify('Back online — your notes are still saved on this device.');
 	}
-
 	function onOffline() {
 		isOnline = false;
 		notify('You’re offline — notes are saved on this device.');
 	}
 
-	function handleServiceWorkerMessage(event) {
-		if (event.data?.type === 'OUTBOX_SYNCED') notify('All changes synced ✅');
+
+	async function waitForWorker(worker) {
+		if (worker.state === 'activated') return;
+		if (worker.state === 'redundant') throw new Error('The service worker installation failed.');
+
+		await new Promise((resolve, reject) => {
+			const onStateChange = () => {
+				if (worker.state === 'activated') {
+					worker.removeEventListener('statechange', onStateChange);
+					resolve();
+				} else if (worker.state === 'redundant') {
+					worker.removeEventListener('statechange', onStateChange);
+					reject(new Error('The service worker installation failed.'));
+				}
+			};
+			worker.addEventListener('statechange', onStateChange);
+			onStateChange();
+		});
 	}
 
 	async function registerServiceWorker() {
 		if (!('serviceWorker' in navigator)) return;
 		try {
-			await navigator.serviceWorker.register('/service-worker.js');
-			navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+			const registration = await navigator.serviceWorker.register('/service-worker.js');
+			if (navigator.onLine) {
+				try {
+					await registration.update();
+				} catch (error) {
+					if (!registration.active) throw error;
+					console.warn('Could not check for a service worker update; using the installed offline cache:', error);
+				}
+			}
+
+			const installingWorker = registration.installing;
+			if (installingWorker) await waitForWorker(installingWorker);
+			const readyRegistration = await navigator.serviceWorker.ready;
+			if (!readyRegistration.active) throw new Error('The offline app shell has no active worker.');
+			await waitForWorker(readyRegistration.active);
+			offlineReady = true;
 		} catch (error) {
-			console.error('Could not register the offline app shell:', error);
-			notify('Offline app setup failed. Reopen the app while online to retry.');
+			console.error('Could not prepare the offline app shell:', error);
+			notify('Offline setup is not ready yet. Keep this page online while it finishes.');
 		}
 	}
-
 	function toggleTheme() {
 		isDark = !isDark;
 		localStorage.setItem('pocket-notes-theme', isDark ? 'dark' : 'light');
@@ -301,7 +311,6 @@
 		return () => {
 			window.removeEventListener('online', onOnline);
 			window.removeEventListener('offline', onOffline);
-			navigator.serviceWorker?.removeEventListener('message', handleServiceWorkerMessage);
 		};
 	});
 
@@ -349,7 +358,7 @@
 			<button class="nav-item theme-button" onclick={toggleTheme}>
 				<span class="nav-icon">{isDark ? '☼' : '◐'}</span><span>{isDark ? 'Light appearance' : 'Dark appearance'}</span>
 			</button>
-			<div class="sidebar-foot"><span class:offline={!isOnline} class="status-dot"></span>{isOnline ? 'Ready when you are' : 'Working offline'}</div>
+			<div class="sidebar-foot"><span class:offline={!isOnline} class="status-dot"></span>{isOnline ? (offlineReady ? 'Offline-ready on this device' : 'Preparing offline access') : 'Working offline'}</div>
 		</div>
 	</aside>
 
@@ -359,7 +368,7 @@
 				<span class="brand-mark small"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M7 8.5A2.5 2.5 0 0 1 9.5 6H24v19H9.5A2.5 2.5 0 0 1 7 22.5z" /><path d="M10 6v19M14 12h6M14 15.5h6M13 20h8l-1 2h-6z" /></svg></span>
 				<span class="brand-name">pocket<span>notes</span></span>
 			</div>
-			<div class="topbar-status"><span class:offline={!isOnline} class="status-dot"></span>{isOnline ? 'All caught up' : 'Offline mode'}</div>
+			<div class="topbar-status"><span class:offline={!isOnline} class="status-dot"></span>{isOnline ? (offlineReady ? 'Offline ready' : 'Getting ready') : 'Offline mode'}</div>
 			<div class="topbar-actions">
 				<button class="icon-button theme-mobile" aria-label={isDark ? 'Switch to light appearance' : 'Switch to dark appearance'} onclick={toggleTheme}>{isDark ? '☼' : '◐'}</button>
 				<button class="primary-button top-create" onclick={() => openEditor()}><span>＋</span> New note</button>
@@ -458,7 +467,7 @@
 	</main>
 
 	<button class="mobile-fab" aria-label="Create a new note" onclick={() => openEditor()}>＋</button>
-	{#if toast}<div class="toast" role="status"><span class="toast-icon">{toast.includes('synced') ? '✓' : '✳'}</span>{toast}</div>{/if}
+	{#if toast}<div class="toast" role="status"><span class="toast-icon">{toast.includes('saved') || toast.includes('Saved') ? '✓' : '✳'}</span>{toast}</div>{/if}
 
 	{#if editorOpen}
 		<div class="modal-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeEditor()}>
